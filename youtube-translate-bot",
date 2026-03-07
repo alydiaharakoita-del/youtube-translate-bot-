@@ -1,0 +1,171 @@
+import logging
+import os
+import yt_dlp
+import openai
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from pydub import AudioSegment
+
+# Configuration du logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Token du bot Telegram (à remplacer par votre token)
+TELEGRAM_BOT_TOKEN = '8409551009:AAFW87z5b_2HJ_Bwi6-DjkLRb1ybjpL-ztY'
+
+# Clé API OpenAI (si vous utilisez l'API OpenAI pour la transcription/traduction)
+# OPENAI_API_KEY = 'YOUR_OPENAI_API_KEY'
+# openai.api_key = OPENAI_API_KEY
+
+# Dictionnaire pour stocker l'état de l'utilisateur (URL de la vidéo, transcription)
+user_data = {}
+
+async def start(update: Update, context) -> None:
+    """Envoie un message de bienvenue lorsque la commande /start est émise."""
+    await update.message.reply_text('🤖 Transcris et traduis les vidéos YouTube en FR, AR, EN. Simple et rapide ! 🎬')
+
+async def handle_youtube_link(update: Update, context) -> None:
+    """Gère les liens YouTube envoyés par l'utilisateur."""
+    youtube_url = update.message.text
+    user_id = update.effective_user.id
+
+    if "youtube.com/watch?v=" not in youtube_url and "youtu.be/" not in youtube_url:
+        await update.message.reply_text("Veuillez envoyer un lien YouTube valide.")
+        return
+
+    await update.message.reply_text("Lien YouTube reçu. Téléchargement de l'audio en cours...")
+
+    try:
+        # Télécharger l'audio de la vidéo YouTube
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': f'{user_id}_audio.%(ext)s',
+            'noplaylist': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(youtube_url, download=True)
+            audio_file = ydl.prepare_filename(info_dict).replace('.webm', '.mp3').replace('.m4a', '.mp3') # yt-dlp might download webm or m4a, ensure mp3
+
+        await update.message.reply_text("Audio téléchargé. Transcription en cours...")
+
+        # Transcrire l'audio avec OpenAI Whisper
+        # Pour utiliser l'API OpenAI, décommentez la ligne OPENAI_API_KEY ci-dessus et utilisez :
+        # with open(audio_file, "rb") as audio:
+        #     transcript = openai.Audio.transcribe("whisper-1", audio)["text"]
+        
+        # Pour utiliser openai-whisper localement (nécessite l'installation de ffmpeg et potentiellement des modèles)
+        import whisper
+        model = whisper.load_model("base") # Vous pouvez choisir un modèle plus grand comme "small", "medium", "large"
+        result = model.transcribe(audio_file)
+        transcript = result["text"]
+
+        user_data[user_id] = {"transcript": transcript, "audio_file": audio_file}
+
+        keyboard = [
+            [InlineKeyboardButton("Français", callback_data='translate_fr')],
+            [InlineKeyboardButton("العربية", callback_data='translate_ar')],
+            [InlineKeyboardButton("English", callback_data='translate_en')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text("Transcription terminée. Choisissez une langue pour la traduction :", reply_markup=reply_markup)
+
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement de la vidéo YouTube : {e}")
+        await update.message.reply_text(f"Une erreur est survenue lors du traitement de votre vidéo : {e}")
+    finally:
+        # Nettoyer le fichier audio après traitement
+        if 'audio_file' in locals() and os.path.exists(audio_file):
+            os.remove(audio_file)
+
+async def button(update: Update, context) -> None:
+    """Gère les clics sur les boutons de langue."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.effective_user.id
+    if user_id not in user_data or "transcript" not in user_data[user_id]:
+        await query.edit_message_text("Désolé, je n'ai pas trouvé de transcription à traduire. Veuillez renvoyer un lien YouTube.")
+        return
+
+    transcript = user_data[user_id]["transcript"]
+    lang_code = query.data.replace('translate_', '')
+    lang_name = {"fr": "Français", "ar": "Arabe", "en": "Anglais"}.get(lang_code, "")
+
+    await query.edit_message_text(f"Traduction en {lang_name} en cours...")
+
+    try:
+        # Traduire la transcription en utilisant l'API OpenAI
+        # Note: Pour une traduction de haute qualité, il est recommandé d'utiliser un modèle de traduction dédié si l'API OpenAI ne suffit pas.
+        # Pour cet exemple, nous utiliserons le modèle de chat pour la traduction.
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini", # Ou "gpt-3.5-turbo" ou un autre modèle disponible
+            messages=[
+                {"role": "system", "content": f"Translate the following text to {lang_name}."},
+                {"role": "user", "content": transcript}
+            ]
+        )
+        translated_text = response.choices[0].message.content
+
+        await query.edit_message_text(f"Traduction en {lang_name} terminée :\n\n{translated_text}")
+
+    except Exception as e:
+        logger.error(f"Erreur lors de la traduction : {e}")
+        await query.edit_message_text(f"Une erreur est survenue lors de la traduction : {e}")
+    finally:
+        # Nettoyer les données utilisateur après la traduction
+        if user_id in user_data:
+            del user_data[user_id]
+
+def main() -> None:
+    """Démarre le bot."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
+    application.add_handler(CallbackQueryHandler(button))
+
+    logger.info("Bot démarré. Appuyez sur Ctrl-C pour l'arrêter.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()FROM python:3.11-slim
+
+# Installation de ffmpeg et des dépendances système
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Définition du répertoire de travail
+WORKDIR /app
+
+# Copie des fichiers de dépendances
+COPY requirements.txt .
+
+# Installation des dépendances Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copie du code source
+COPY . .
+
+# Commande de lancement
+CMD ["python", "youtube_translator_bot.py"]
+
+python-telegram-bot
+yt-dlp
+openai-whisper
+openai
+pydub
+torch
+numpy
+certifi
+
+worker: python3 youtube_translator_bot.py
+
+Bot Telegram de Transcription et Traduction YouTubeCe bot Telegram permet de transcrire l'audio de vidéos YouTube et de traduire la transcription en Français, Arabe ou Anglais.Fonctionnalités•Accepte un lien YouTube.•Extrait et transcrit l'audio de la vidéo YouTube.•Propose à l'utilisateur de choisir la langue de traduction (FR, AR, EN).•Traduit la transcription dans la langue choisie.•Renvoie le texte traduit à l'utilisateur.•Commande /start avec un message d'accueil.Déploiement sur RailwaySuivez ces étapes pour déployer le bot sur Railway.Prérequis•Un compte Railway (https://railway.app/)•Un token de bot Telegram (obtenu via BotFather)•Une clé API OpenAI (si vous utilisez l'API OpenAI pour la transcription/traduction)Étapes de déploiement1.Créez un nouveau projet sur Railway :•Connectez-vous à votre compte Railway.•Cliquez sur New Project.•Choisissez Deploy from GitHub Repo si votre code est sur GitHub, ou Deploy from a private Git repository.•Si vous n'utilisez pas Git, vous pouvez créer un service vide et uploader les fichiers manuellement.2.Configurez les variables d'environnement :•Dans les paramètres de votre projet Railway, allez dans la section Variables.•Ajoutez les variables suivantes :•TELEGRAM_BOT_TOKEN : Votre token de bot Telegram (ex: 8409551009:AAFW87z5b_2HJ_Bwi6-DjkLRb1ybjpL-ztY)•OPENAI_API_KEY : Votre clé API OpenAI (si vous utilisez l'API OpenAI pour la transcription/traduction)3.Déploiement :•Railway détectera automatiquement le Dockerfile et le Procfile.•Le service devrait commencer à se construire et à se déployer.•Assurez-vous que le build se termine avec succès.4.Vérifiez les logs :•Dans la section Logs de votre service Railway, vous devriez voir les logs de démarrage du bot, confirmant qu'il est en cours d'exécution.Utilisation du BotUne fois le bot déployé et en ligne :1.Ouvrez Telegram et recherchez votre bot.2.Démarrez une conversation avec la commande /start.3.Envoyez un lien YouTube à votre bot.4.Choisissez la langue de traduction parmi les options proposées.5.Le bot vous renverra la transcription et la traduction.Fichiers inclus•youtube_translator_bot.py: Le code source du bot Telegram.•requirements.txt: Liste des dépendances Python.•Procfile: Commande de démarrage pour Railway.•Dockerfile: Instructions pour construire l'image Docker du bot.•README.md: Ce fichier avec les instructions de déploiement
