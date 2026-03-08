@@ -1,0 +1,8 @@
+python-telegram-bot
+yt-dlp
+openai-whisper
+openai
+pydub
+torch
+numpy
+certifi
